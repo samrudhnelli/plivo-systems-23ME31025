@@ -45,12 +45,15 @@
 #define TYPE_NACK       0x04
 #define TYPE_FEC_BRIDGE 0x05
 
+#define LIKELY(x)   __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+
 #define BUF_SIZE    8192
 #define BUF_MASK    (BUF_SIZE - 1)
 
-/* Lock-free Jitter buffer (64-bit aligned for SIMD XOR) */
-static uint64_t           jbuf_payload[BUF_SIZE][PAYLOAD_U64];
-static _Atomic int        jbuf_received[BUF_SIZE];
+/* Lock-free Jitter buffer (64-bit aligned for SIMD XOR, padded to 64-byte boundary to prevent false sharing) */
+static uint64_t           jbuf_payload[BUF_SIZE][PAYLOAD_U64] __attribute__((aligned(64)));
+static _Atomic int        jbuf_received[BUF_SIZE] __attribute__((aligned(64)));
 
 /* FEC buffer: store FEC packets for recovery (only accessed by receiver thread) */
 static uint64_t           fec_payload[BUF_SIZE][PAYLOAD_U64];
@@ -294,7 +297,7 @@ int main(void) {
     uint8_t buf[2048];
     for (;;) {
         int nfds = epoll_wait(ep_fd, events, 4, -1);
-        if (nfds < 0) {
+        if (UNLIKELY(nfds < 0)) {
             if (errno == EINTR) continue;
             perror("epoll_wait");
             break;
@@ -303,7 +306,7 @@ int main(void) {
         double now = now_sec();
 
         for (int i = 0; i < nfds; i++) {
-            if (events[i].data.fd == t_fd) {
+            if (UNLIKELY(events[i].data.fd == t_fd)) {
                 /* Timer fired: consume expiration to reset state */
                 uint64_t expirations;
                 if (read(t_fd, &expirations, sizeof(expirations)) < 0) {
@@ -323,21 +326,21 @@ int main(void) {
                         }
                     }
                 }
-            } else if (events[i].data.fd == in_fd) {
+            } else if (LIKELY(events[i].data.fd == in_fd)) {
                 /* UDP Packet ready */
                 ssize_t n = recvfrom(in_fd, buf, sizeof(buf), 0, NULL, NULL);
-                if (n < WIRE_HDR) continue;
+                if (UNLIKELY(n < WIRE_HDR)) continue;
 
                 uint8_t type = buf[0];
                 uint16_t seq = ((uint16_t)buf[1] << 8) | buf[2];
                 uint8_t *payload = buf + WIRE_HDR;
 
-                if (seq >= n_frames) continue;
+                if (UNLIKELY(seq >= n_frames)) continue;
 
-                if (type == TYPE_DATA || type == TYPE_RETX) {
+                if (LIKELY(type == TYPE_DATA || type == TYPE_RETX)) {
                     /* On retransmission arrival, dynamically update SRTT */
                     int idx = seq & BUF_MASK;
-                    if (type == TYPE_RETX && nack_sent_time[idx] > 0.0) {
+                    if (UNLIKELY(type == TYPE_RETX && nack_sent_time[idx] > 0.0)) {
                         double rtt = now - nack_sent_time[idx];
                         if (rtt > 0.0 && rtt < 0.5) {
                             srtt = 0.875 * srtt + 0.125 * rtt;
@@ -373,7 +376,7 @@ int main(void) {
                              }
                          }
                     }
-                } else if (type == TYPE_FEC || type == TYPE_FEC_BRIDGE) {
+                } else if (UNLIKELY(type == TYPE_FEC || type == TYPE_FEC_BRIDGE)) {
                     int fec_idx = seq & BUF_MASK;
                     if (!fec_received[fec_idx]) {
                         memcpy(fec_payload[fec_idx], payload, PAYLOAD_BYTES);

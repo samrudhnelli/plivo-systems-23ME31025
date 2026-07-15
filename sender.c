@@ -39,12 +39,15 @@
 #define TYPE_NACK       0x04
 #define TYPE_FEC_BRIDGE 0x05
 
+#define LIKELY(x)   __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+
 #define RING_SIZE   4096
 #define RING_MASK   (RING_SIZE - 1)
 
-/* Ring buffer for retransmission (64-bit aligned for SIMD XOR) */
-static uint64_t ring_payload[RING_SIZE][PAYLOAD_U64];
-static int      ring_valid[RING_SIZE];
+/* Ring buffer for retransmission (64-bit aligned for SIMD XOR, padded to 64-byte boundary to prevent false sharing) */
+static uint64_t ring_payload[RING_SIZE][PAYLOAD_U64] __attribute__((aligned(64)));
+static int      ring_valid[RING_SIZE] __attribute__((aligned(64)));
 static pthread_mutex_t ring_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Shared socket for sending to relay */
@@ -72,8 +75,8 @@ static void *feedback_thread(void *arg) {
 
     for (;;) {
         ssize_t n = recvfrom(fb_fd, buf, sizeof(buf), 0, NULL, NULL);
-        if (n < WIRE_HDR) continue;
-        if (buf[0] != TYPE_NACK) continue;
+        if (UNLIKELY(n < WIRE_HDR)) continue;
+        if (UNLIKELY(buf[0] != TYPE_NACK)) continue;
 
         uint16_t seq = ((uint16_t)buf[1] << 8) | buf[2];
         int idx = seq & RING_MASK;
@@ -135,7 +138,7 @@ int main(void) {
     uint8_t buf[2048];
     for (;;) {
         ssize_t n = recvfrom(in_fd, buf, sizeof(buf), 0, NULL, NULL);
-        if (n < HARNESS_HDR + PAYLOAD_BYTES) continue;
+        if (UNLIKELY(n < HARNESS_HDR + PAYLOAD_BYTES)) continue;
 
         /* Parse harness frame: 4-byte big-endian seq + 160-byte payload */
         uint32_t seq32 = ((uint32_t)buf[0] << 24) |
@@ -156,7 +159,7 @@ int main(void) {
         send_wire_packet(TYPE_DATA, seq, payload);
 
         /* Generate XOR FEC payload with previous frame */
-        if (prev_seq >= 0 && seq == (uint16_t)(prev_seq + 1)) {
+        if (LIKELY(prev_seq >= 0 && seq == (uint16_t)(prev_seq + 1))) {
             uint64_t fec_pl[PAYLOAD_U64];
             uint64_t *curr_pl = ring_payload[idx];
             
