@@ -1,50 +1,170 @@
-/* BASELINE SENDER (C) — naive on purpose. Rewrite it (C, C++, Go, or Rust).
+/*
+ * SENDER — Pair-FEC + NACK retransmission
  *
- * Ports (all 127.0.0.1):
- *   bind 47010  <- harness source delivers frame i here at t0 + i*20ms
- *                  (format: 4-byte big-endian seq + 160-byte payload)
- *   send 47001  -> relay uplink toward the receiver (YOUR wire format)
- *   bind 47004  <- feedback from your receiver, via the relay (optional)
+ * Wire format (sender → relay → receiver):
+ *   [1 byte type] [2 byte big-endian seq] [160 byte payload] = 163 bytes
  *
- * This baseline forwards each frame once, unchanged, and ignores feedback.
- * No redundancy, no retransmission. It cannot pass. That is the point.
+ * Type values:
+ *   0x01 = DATA     (original frame)
+ *   0x02 = FEC      (XOR of pair: seq = first of pair, payload = p[i] ^ p[i+1])
+ *   0x03 = RETRANSMIT (same as DATA, in response to NACK)
  *
- * Env vars available if you want them: T0 (epoch seconds, float),
- * DURATION_S, DELAY_MS. The harness kills this process when the run ends,
- * so a forever-loop is fine.
+ * NACK format (receiver → relay → sender):
+ *   [1 byte type=0x04] [2 byte big-endian seq] = 3 bytes
  *
- * build: make        run: python3 run.py --delay_ms 60
+ * Ports:
+ *   bind 47010 ← harness source (4-byte BE seq + 160-byte payload)
+ *   send 47001 → relay uplink
+ *   bind 47004 ← feedback from receiver via relay
  */
 #include <arpa/inet.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define PAYLOAD_BYTES 160
+#define HARNESS_HDR   4
+#define WIRE_HDR      3        /* 1 type + 2 seq */
+#define WIRE_PKT      (WIRE_HDR + PAYLOAD_BYTES)  /* 163 */
+
+#define TYPE_DATA   0x01
+#define TYPE_FEC    0x02
+#define TYPE_RETX   0x03
+#define TYPE_NACK   0x04
+
+#define RING_SIZE   4096
+#define RING_MASK   (RING_SIZE - 1)
+
+/* Ring buffer for retransmission */
+static uint8_t  ring_payload[RING_SIZE][PAYLOAD_BYTES];
+static int      ring_valid[RING_SIZE];
+static pthread_mutex_t ring_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Shared socket for sending to relay */
+static int out_fd;
+static struct sockaddr_in relay_addr;
+
+/* FEC state: hold previous frame for pair generation */
+static uint8_t  prev_payload[PAYLOAD_BYTES];
+static int      prev_seq = -1;
+
+static void send_wire_packet(uint8_t type, uint16_t seq, const uint8_t *payload) {
+    uint8_t pkt[WIRE_PKT];
+    pkt[0] = type;
+    pkt[1] = (uint8_t)(seq >> 8);
+    pkt[2] = (uint8_t)(seq & 0xFF);
+    memcpy(pkt + WIRE_HDR, payload, PAYLOAD_BYTES);
+    sendto(out_fd, pkt, WIRE_PKT, 0,
+           (struct sockaddr *)&relay_addr, sizeof(relay_addr));
+}
+
+/* Feedback listener thread: receives NACKs, retransmits from ring buffer */
+static void *feedback_thread(void *arg) {
+    int fb_fd = *(int *)arg;
+    uint8_t buf[64];
+
+    for (;;) {
+        ssize_t n = recvfrom(fb_fd, buf, sizeof(buf), 0, NULL, NULL);
+        if (n < WIRE_HDR) continue;
+        if (buf[0] != TYPE_NACK) continue;
+
+        uint16_t seq = ((uint16_t)buf[1] << 8) | buf[2];
+        int idx = seq & RING_MASK;
+
+        pthread_mutex_lock(&ring_lock);
+        if (ring_valid[idx]) {
+            uint8_t payload_copy[PAYLOAD_BYTES];
+            memcpy(payload_copy, ring_payload[idx], PAYLOAD_BYTES);
+            pthread_mutex_unlock(&ring_lock);
+            send_wire_packet(TYPE_RETX, seq, payload_copy);
+        } else {
+            pthread_mutex_unlock(&ring_lock);
+        }
+    }
+    return NULL;
+}
+
 int main(void) {
+    /* Bind to receive harness frames */
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in in_addr = {0};
+    struct sockaddr_in in_addr;
+    memset(&in_addr, 0, sizeof(in_addr));
     in_addr.sin_family = AF_INET;
     in_addr.sin_port = htons(47010);
     in_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    if (bind(in_fd, (struct sockaddr *)&in_addr, sizeof in_addr) < 0) {
+    if (bind(in_fd, (struct sockaddr *)&in_addr, sizeof(in_addr)) < 0) {
         perror("bind 47010");
         return 1;
     }
 
-    int out_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in relay = {0};
-    relay.sin_family = AF_INET;
-    relay.sin_port = htons(47001);
-    relay.sin_addr.s_addr = inet_addr("127.0.0.1");
+    /* Output socket to relay */
+    out_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    memset(&relay_addr, 0, sizeof(relay_addr));
+    relay_addr.sin_family = AF_INET;
+    relay_addr.sin_port = htons(47001);
+    relay_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    unsigned char buf[2048];
+    /* Feedback socket */
+    int fb_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in fb_addr;
+    memset(&fb_addr, 0, sizeof(fb_addr));
+    fb_addr.sin_family = AF_INET;
+    fb_addr.sin_port = htons(47004);
+    fb_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (bind(fb_fd, (struct sockaddr *)&fb_addr, sizeof(fb_addr)) < 0) {
+        perror("bind 47004");
+        return 1;
+    }
+
+    /* Initialize ring buffer */
+    memset(ring_valid, 0, sizeof(ring_valid));
+
+    /* Start feedback listener thread */
+    pthread_t fb_tid;
+    pthread_create(&fb_tid, NULL, feedback_thread, &fb_fd);
+    pthread_detach(fb_tid);
+
+    /* Main loop: receive from harness, send DATA + FEC */
+    uint8_t buf[2048];
     for (;;) {
-        ssize_t n = recvfrom(in_fd, buf, sizeof buf, 0, NULL, NULL);
-        if (n <= 0) continue;
-        /* your protocol design goes here; baseline = send once, as-is */
-        sendto(out_fd, buf, (size_t)n, 0, (struct sockaddr *)&relay,
-               sizeof relay);
+        ssize_t n = recvfrom(in_fd, buf, sizeof(buf), 0, NULL, NULL);
+        if (n < HARNESS_HDR + PAYLOAD_BYTES) continue;
+
+        /* Parse harness frame: 4-byte big-endian seq + 160-byte payload */
+        uint32_t seq32 = ((uint32_t)buf[0] << 24) |
+                         ((uint32_t)buf[1] << 16) |
+                         ((uint32_t)buf[2] << 8)  |
+                         ((uint32_t)buf[3]);
+        uint16_t seq = (uint16_t)(seq32 & 0xFFFF);
+        uint8_t *payload = buf + HARNESS_HDR;
+
+        /* Store in ring buffer */
+        int idx = seq & RING_MASK;
+        pthread_mutex_lock(&ring_lock);
+        memcpy(ring_payload[idx], payload, PAYLOAD_BYTES);
+        ring_valid[idx] = 1;
+        pthread_mutex_unlock(&ring_lock);
+
+        /* Send DATA packet */
+        send_wire_packet(TYPE_DATA, seq, payload);
+
+        /* FEC: pair with previous frame */
+        if (prev_seq >= 0 && seq == (uint16_t)(prev_seq + 1)) {
+            /* Generate XOR FEC for the pair (prev_seq, seq) */
+            uint8_t fec_payload[PAYLOAD_BYTES];
+            for (int j = 0; j < PAYLOAD_BYTES; j++) {
+                fec_payload[j] = prev_payload[j] ^ payload[j];
+            }
+            send_wire_packet(TYPE_FEC, (uint16_t)prev_seq, fec_payload);
+        }
+
+        /* Save current as "previous" for next FEC pair */
+        memcpy(prev_payload, payload, PAYLOAD_BYTES);
+        prev_seq = (int)seq;
     }
     return 0;
 }
