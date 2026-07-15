@@ -1,22 +1,5 @@
 /*
- * SENDER — Dual FEC (non-overlapping + bridge pairs) + NACK retransmission
- *
- * Wire format (sender → relay → receiver):
- *   [1 byte type] [2 byte big-endian seq] [160 byte payload] = 163 bytes
- *
- * Type values:
- *   0x01 = DATA       (original frame)
- *   0x02 = FEC        (XOR of non-overlapping pair: seq=even, covers (seq, seq+1))
- *   0x03 = RETRANSMIT (same as DATA, in response to NACK)
- *   0x05 = FEC_BRIDGE (XOR of bridge pair: seq=odd, covers (seq, seq+1))
- *
- * NACK format (receiver → relay → sender):
- *   [1 byte type=0x04] [2 byte big-endian seq] = 3 bytes
- *
- * FEC scheme:
- *   Non-overlapping: (0,1),(2,3),(4,5)... — emitted on odd frames
- *   Bridge:          (1,2),(3,4),(5,6)... — emitted on even frames (except 0)
- *   Each frame (except 0 and last) is protected by TWO independent FEC packets.
+ * SENDER — Portable Lock-Free Dual FEC + Ring Buffer NACKs
  */
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -26,6 +9,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 #define PAYLOAD_BYTES 160
 #define PAYLOAD_U64   (PAYLOAD_BYTES / 8) /* 20 blocks of 64-bit integers */
@@ -45,10 +29,9 @@
 #define RING_SIZE   4096
 #define RING_MASK   (RING_SIZE - 1)
 
-/* Ring buffer for retransmission (64-bit aligned for SIMD XOR, padded to 64-byte boundary to prevent false sharing) */
+/* Ring buffer for retransmission (aligned to prevent false sharing, lock-free SPSC) */
 static uint64_t ring_payload[RING_SIZE][PAYLOAD_U64] __attribute__((aligned(64)));
-static int      ring_valid[RING_SIZE] __attribute__((aligned(64)));
-static pthread_mutex_t ring_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int ring_valid[RING_SIZE] __attribute__((aligned(64)));
 
 /* Shared socket for sending to relay */
 static int out_fd;
@@ -68,7 +51,7 @@ static void send_wire_packet(uint8_t type, uint16_t seq, const uint8_t *payload)
            (struct sockaddr *)&relay_addr, sizeof(relay_addr));
 }
 
-/* Feedback listener thread: receives NACKs, retransmits from ring buffer */
+/* Feedback listener thread: receives NACKs, retransmits from ring buffer (lock-free read) */
 static void *feedback_thread(void *arg) {
     int fb_fd = *(int *)arg;
     uint8_t buf[64];
@@ -81,14 +64,10 @@ static void *feedback_thread(void *arg) {
         uint16_t seq = ((uint16_t)buf[1] << 8) | buf[2];
         int idx = seq & RING_MASK;
 
-        pthread_mutex_lock(&ring_lock);
-        if (ring_valid[idx]) {
+        if (atomic_load_explicit(&ring_valid[idx], memory_order_acquire)) {
             uint64_t payload_copy[PAYLOAD_U64];
             memcpy(payload_copy, ring_payload[idx], PAYLOAD_BYTES);
-            pthread_mutex_unlock(&ring_lock);
             send_wire_packet(TYPE_RETX, seq, (const uint8_t *)payload_copy);
-        } else {
-            pthread_mutex_unlock(&ring_lock);
         }
     }
     return NULL;
@@ -127,7 +106,9 @@ int main(void) {
     }
 
     /* Initialize ring buffer */
-    memset(ring_valid, 0, sizeof(ring_valid));
+    for (int i = 0; i < RING_SIZE; i++) {
+        atomic_store_explicit(&ring_valid[i], 0, memory_order_relaxed);
+    }
 
     /* Start feedback listener thread */
     pthread_t fb_tid;
@@ -148,12 +129,10 @@ int main(void) {
         uint16_t seq = (uint16_t)(seq32 & 0xFFFF);
         uint8_t *payload = buf + HARNESS_HDR;
 
-        /* Store in ring buffer */
+        /* Store in ring buffer (lock-free write) */
         int idx = seq & RING_MASK;
-        pthread_mutex_lock(&ring_lock);
         memcpy(ring_payload[idx], payload, PAYLOAD_BYTES);
-        ring_valid[idx] = 1;
-        pthread_mutex_unlock(&ring_lock);
+        atomic_store_explicit(&ring_valid[idx], 1, memory_order_release);
 
         /* Send DATA packet */
         send_wire_packet(TYPE_DATA, seq, payload);

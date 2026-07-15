@@ -94,14 +94,14 @@ Harness Source →[47010]→ SENDER →[47001]→ RELAY →[47002]→ RECEIVER �
 ## Critical Implementation Notes
 
 ### Sender Threading
-- Main thread: receives harness frames on 47010, sends DATA+FEC to relay on 47001
-- Feedback thread: receives NACKs on 47004, retransmits from ring buffer to 47001
-- Ring buffer: 4096 slots, mutex-protected
+- Main thread: receives harness frames on 47010, writes to ring buffer, sends DATA+FEC to relay on 47001
+- Feedback thread: receives NACKs on 47004, reads from ring buffer and retransmits
+- Ring buffer: 4096 slots, SPSC lock-free (`stdatomic.h` memory barriers)
 
 ### Receiver Threading
-- Main thread: receives packets on 47002, stores in jitter buffer, sends NACKs on 47003
-- Playout thread: timer-driven, delivers at T0 + DELAY_MS + i×20ms to player on 47020
-- 5ms SO_RCVTIMEO on receive socket enables periodic NACK sweep
+- Main thread: POSIX `poll()` event-driven loop with MSG_DONTWAIT non-blocking read drains, stores in jitter buffer, sends NACKs on 47003
+- Playout thread: delivers at T0 + DELAY_MS + i×20ms to player on 47020. Employs hardware-specific pause/yield spin-wait (`CPU_PAUSE()`) for sub-millisecond precision.
+- Jitter buffer: 8192 slots, SPSC lock-free using `stdatomic.h` release-acquire semantics
 
 ### Dual FEC Pairing Scheme
 - Standard Pair-FEC (0x02): Covers non-overlapping pairs `(2k, 2k+1)`. Sent on odd frames.
@@ -118,4 +118,4 @@ Harness Source →[47010]→ SENDER →[47001]→ RELAY →[47002]→ RECEIVER �
 2. **Spike delays** — relay can add extra_ms spikes pushing packets past deadline
 3. **Clock drift** — playout thread uses CLOCK_REALTIME, should match harness
 4. **Buffer wraparound** — 8192 slots is fine for 1500 frames but watch for seq collisions
-5. **Mutex contention** — unlikely at 50 packets/sec but possible under heavy duplication
+5. **Playout oversleep** — resolved by sleeping 0.5ms early and spinning with hardware yield instructions

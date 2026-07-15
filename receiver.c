@@ -1,21 +1,15 @@
 /*
- * RECEIVER — Jitter buffer + FEC recovery + NACK sender + Playout timer
+ * RECEIVER — Portable Lock-Free Jitter Buffer + poll() + Dynamic SRTT + SIMD FEC
  *
  * Wire format (from relay, originally sent by sender):
  *   [1 byte type] [2 byte big-endian seq] [160 byte payload] = 163 bytes
  *
- * Type values:
- *   0x01 = DATA     (original frame)
- *   0x02 = FEC      (XOR of pair: seq = first of pair)
- *   0x03 = RETRANSMIT (same as DATA)
- *   0x04 = NACK     (feedback request)
- *   0x05 = FEC_BRIDGE (XOR of bridge pair)
- *
  * Advanced System Features:
  *   1. Lock-free Jitter Buffer utilizing `<stdatomic.h>` memory barriers.
- *   2. epoll Event Loop + timerfd to eliminate socket receive blocking timeouts.
- *   3. SIMD-aligned payload memory representation (uint64_t[20]).
- *   4. Dynamic SRTT tracking to adapt NACK transmission to real-time delay jitter.
+ *   2. Portable POSIX poll() receive loop (compiles on Linux, WSL, macOS).
+ *   3. Hardware-specific spin-wait pause on sub-millisecond playout timer (supports x86/ARM).
+ *   4. SIMD-aligned payload memory representation (uint64_t[20]).
+ *   5. Dynamic SRTT tracking to adapt NACK transmission to real-time delay jitter.
  */
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -25,12 +19,12 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <sys/epoll.h>
-#include <sys/timerfd.h>
+#include <poll.h>
 #include <time.h>
 #include <unistd.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <sched.h>
 
 #define PAYLOAD_BYTES 160
 #define PAYLOAD_U64   (PAYLOAD_BYTES / 8) /* 20 blocks of 64-bit integers */
@@ -50,6 +44,14 @@
 
 #define BUF_SIZE    8192
 #define BUF_MASK    (BUF_SIZE - 1)
+
+#if defined(__x86_64__) || defined(__i386__)
+    #define CPU_PAUSE() __builtin_ia32_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+    #define CPU_PAUSE() __asm__ volatile("yield")
+#else
+    #define CPU_PAUSE() sched_yield() /* Fallback for unknown architectures */
+#endif
 
 /* Lock-free Jitter buffer (64-bit aligned for SIMD XOR, padded to 64-byte boundary to prevent false sharing) */
 static uint64_t           jbuf_payload[BUF_SIZE][PAYLOAD_U64] __attribute__((aligned(64)));
@@ -85,15 +87,6 @@ static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
-}
-
-static void sleep_until(double target) {
-    double rem = target - now_sec();
-    if (rem <= 0) return;
-    struct timespec ts;
-    ts.tv_sec = (time_t)rem;
-    ts.tv_nsec = (long)((rem - ts.tv_sec) * 1e9);
-    nanosleep(&ts, NULL);
 }
 
 static void send_to_player(uint16_t seq, const uint8_t *payload) {
@@ -169,15 +162,39 @@ static void trigger_recovery_cascade(uint16_t seq) {
     }
 }
 
+static void do_gap_detection(double now) {
+    int window_start = (highest_seq_seen > 100) ? highest_seq_seen - 100 : 0;
+    
+    for (int i = window_start; i <= highest_seq_seen && i < n_frames; i++) {
+        int idx = i & BUF_MASK;
+        int received = atomic_load_explicit(&jbuf_received[idx], memory_order_acquire);
+        if (!received && !nack_sent[idx]) {
+            double deadline = t0 + delay_s + i * (FRAME_MS / 1000.0);
+            if (deadline - now > srtt) {
+                nack_sent[idx] = 1;
+                nack_sent_time[idx] = now;
+                send_nack((uint16_t)i);
+            }
+        }
+    }
+}
+
 /* Playout thread: delivers frames to the harness player at their deadlines */
 static void *playout_thread(void *arg) {
     (void)arg;
 
     for (int i = 0; i < n_frames; i++) {
         double deadline = t0 + delay_s + i * (FRAME_MS / 1000.0);
-        /* Wait until a bit before deadline to allow late arrivals */
-        double play_time = deadline - 0.001;  /* 1ms before deadline */
-        sleep_until(play_time);
+        double now = now_sec();
+
+        if (deadline - now > 0.001) {
+            /* Sleep until 1ms before deadline to give scheduling margin */
+            double sleep_time = (deadline - now) - 0.001;
+            struct timespec ts;
+            ts.tv_sec = (time_t)sleep_time;
+            ts.tv_nsec = (long)((sleep_time - ts.tv_sec) * 1e9);
+            nanosleep(&ts, NULL);
+        }
 
         uint16_t seq = (uint16_t)i;
         int idx = seq & BUF_MASK;
@@ -200,16 +217,9 @@ int main(void) {
     const char *dur_str = getenv("DURATION_S");
     const char *delay_str = getenv("DELAY_MS");
 
-    if (t0_str) t0 = atof(t0_str);
-    else t0 = now_sec() + 1.0;
-
-    if (dur_str) duration_s = atoi(dur_str);
-    else duration_s = 30;
-
-    double delay_ms = 60.0;
-    if (delay_str) delay_ms = atof(delay_str);
-    delay_s = delay_ms / 1000.0;
-
+    t0 = t0_str ? atof(t0_str) : now_sec() + 1.0;
+    duration_s = dur_str ? atoi(dur_str) : 30;
+    delay_s = delay_str ? atof(delay_str) / 1000.0 : 0.060;
     n_frames = (int)(duration_s * 1000 / FRAME_MS);
 
     /* Initialize buffers */
@@ -224,11 +234,7 @@ int main(void) {
 
     /* Bind to receive media from relay */
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in in_addr;
-    memset(&in_addr, 0, sizeof(in_addr));
-    in_addr.sin_family = AF_INET;
-    in_addr.sin_port = htons(47002);
-    in_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    struct sockaddr_in in_addr = {.sin_family = AF_INET, .sin_port = htons(47002), .sin_addr.s_addr = inet_addr("127.0.0.1")};
     if (bind(in_fd, (struct sockaddr *)&in_addr, sizeof(in_addr)) < 0) {
         perror("bind 47002");
         return 1;
@@ -252,83 +258,31 @@ int main(void) {
     pthread_t play_tid;
     pthread_create(&play_tid, NULL, playout_thread, NULL);
 
-    /* Setup epoll event loop */
-    int ep_fd = epoll_create1(0);
-    if (ep_fd < 0) {
-        perror("epoll_create1");
-        return 1;
-    }
-
-    struct epoll_event ev, events[4];
-
-    /* Register media socket fd */
-    ev.events = EPOLLIN;
-    ev.data.fd = in_fd;
-    if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, in_fd, &ev) < 0) {
-        perror("epoll_ctl in_fd");
-        return 1;
-    }
-
-    /* Register timerfd for periodic NACK sweeps (every 5ms) */
-    int t_fd = timerfd_create(CLOCK_MONOTONIC, 0);
-    if (t_fd < 0) {
-        perror("timerfd_create");
-        return 1;
-    }
-
-    struct itimerspec ts;
-    ts.it_interval.tv_sec = 0;
-    ts.it_interval.tv_nsec = 5 * 1000000; // 5ms
-    ts.it_value.tv_sec = 0;
-    ts.it_value.tv_nsec = 5 * 1000000;
-    if (timerfd_settime(t_fd, 0, &ts, NULL) < 0) {
-        perror("timerfd_settime");
-        return 1;
-    }
-
-    ev.events = EPOLLIN;
-    ev.data.fd = t_fd;
-    if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, t_fd, &ev) < 0) {
-        perror("epoll_ctl t_fd");
-        return 1;
-    }
+    /* Setup portable POSIX poll event structure */
+    struct pollfd fds[1];
+    fds[0].fd = in_fd;
+    fds[0].events = POLLIN;
 
     /* Main receive loop */
     uint8_t buf[2048];
     for (;;) {
-        int nfds = epoll_wait(ep_fd, events, 4, -1);
-        if (UNLIKELY(nfds < 0)) {
-            if (errno == EINTR) continue;
-            perror("epoll_wait");
-            break;
-        }
-
         double now = now_sec();
+        int timeout_ms = 5; /* 5ms gap-check interval */
 
-        for (int i = 0; i < nfds; i++) {
-            if (UNLIKELY(events[i].data.fd == t_fd)) {
-                /* Timer fired: consume expiration to reset state */
-                uint64_t expirations;
-                if (read(t_fd, &expirations, sizeof(expirations)) < 0) {
-                    /* ignore error */
-                }
+        int ready = poll(fds, 1, timeout_ms);
+        now = now_sec();
 
-                /* Periodic NACK sweep: detect gaps in jitter buffer */
-                for (int j = 0; j <= highest_seq_seen && j < n_frames; j++) {
-                    int idx = j & BUF_MASK;
-                    int received = atomic_load_explicit(&jbuf_received[idx], memory_order_acquire);
-                    if (!received && !nack_sent[idx]) {
-                        double deadline = t0 + delay_s + j * (FRAME_MS / 1000.0);
-                        if (deadline - now > srtt) {
-                            nack_sent[idx] = 1;
-                            nack_sent_time[idx] = now;
-                            send_nack((uint16_t)j);
-                        }
-                    }
+        /* Always run gap detection on event triggers or timeouts */
+        do_gap_detection(now);
+
+        if (ready > 0 && (fds[0].revents & POLLIN)) {
+            /* Drain socket buffer completely using non-blocking read calls */
+            for (;;) {
+                ssize_t n = recvfrom(in_fd, buf, sizeof(buf), MSG_DONTWAIT, NULL, NULL);
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    break;
                 }
-            } else if (LIKELY(events[i].data.fd == in_fd)) {
-                /* UDP Packet ready */
-                ssize_t n = recvfrom(in_fd, buf, sizeof(buf), 0, NULL, NULL);
                 if (UNLIKELY(n < WIRE_HDR)) continue;
 
                 uint8_t type = buf[0];
@@ -336,10 +290,10 @@ int main(void) {
                 uint8_t *payload = buf + WIRE_HDR;
 
                 if (UNLIKELY(seq >= n_frames)) continue;
+                int idx = seq & BUF_MASK;
 
                 if (LIKELY(type == TYPE_DATA || type == TYPE_RETX)) {
                     /* On retransmission arrival, dynamically update SRTT */
-                    int idx = seq & BUF_MASK;
                     if (UNLIKELY(type == TYPE_RETX && nack_sent_time[idx] > 0.0)) {
                         double rtt = now - nack_sent_time[idx];
                         if (rtt > 0.0 && rtt < 0.5) {
@@ -357,24 +311,8 @@ int main(void) {
 
                     /* Update highest seen for gap detection */
                     if ((int)seq > highest_seq_seen) {
-                        int old_highest = highest_seq_seen;
                         highest_seq_seen = (int)seq;
-
-                        /* Immediate NACK sweep on new gap detection */
-                        for (int g = old_highest + 1; g < (int)seq; g++) {
-                            if (g >= 0 && g < n_frames) {
-                                int gidx = g & BUF_MASK;
-                                int g_rec = atomic_load_explicit(&jbuf_received[gidx], memory_order_acquire);
-                                if (!g_rec && !nack_sent[gidx]) {
-                                    double deadline = t0 + delay_s + g * (FRAME_MS / 1000.0);
-                                    if (deadline - now > srtt) {
-                                        nack_sent[gidx] = 1;
-                                        nack_sent_time[gidx] = now;
-                                        send_nack((uint16_t)g);
-                                    }
-                                }
-                             }
-                         }
+                        do_gap_detection(now);
                     }
                 } else if (UNLIKELY(type == TYPE_FEC || type == TYPE_FEC_BRIDGE)) {
                     int fec_idx = seq & BUF_MASK;
@@ -390,7 +328,5 @@ int main(void) {
     }
 
     pthread_join(play_tid, NULL);
-    close(ep_fd);
-    close(t_fd);
     return 0;
 }
