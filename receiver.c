@@ -336,14 +336,15 @@ int main(void) {
 
                 if (type == TYPE_DATA || type == TYPE_RETX) {
                     /* On retransmission arrival, dynamically update SRTT */
-                    if (type == TYPE_RETX) {
-                        double rtt = now - nack_sent_time[seq & BUF_MASK];
+                    int idx = seq & BUF_MASK;
+                    if (type == TYPE_RETX && nack_sent_time[idx] > 0.0) {
+                        double rtt = now - nack_sent_time[idx];
                         if (rtt > 0.0 && rtt < 0.5) {
                             srtt = 0.875 * srtt + 0.125 * rtt;
                         }
+                        nack_sent_time[idx] = 0.0; // Prevent duplicate packets from inflating SRTT
                     }
 
-                    int idx = seq & BUF_MASK;
                     int received = atomic_load_explicit(&jbuf_received[idx], memory_order_acquire);
                     if (!received) {
                         memcpy(jbuf_payload[idx], payload, PAYLOAD_BYTES);
