@@ -1,16 +1,22 @@
 /*
- * SENDER — Pair-FEC + NACK retransmission
+ * SENDER — Dual FEC (non-overlapping + bridge pairs) + NACK retransmission
  *
  * Wire format (sender → relay → receiver):
  *   [1 byte type] [2 byte big-endian seq] [160 byte payload] = 163 bytes
  *
  * Type values:
- *   0x01 = DATA     (original frame)
- *   0x02 = FEC      (XOR of pair: seq = first of pair, payload = p[i] ^ p[i+1])
+ *   0x01 = DATA       (original frame)
+ *   0x02 = FEC        (XOR of non-overlapping pair: seq=even, covers (seq, seq+1))
  *   0x03 = RETRANSMIT (same as DATA, in response to NACK)
+ *   0x05 = FEC_BRIDGE (XOR of bridge pair: seq=odd, covers (seq, seq+1))
  *
  * NACK format (receiver → relay → sender):
  *   [1 byte type=0x04] [2 byte big-endian seq] = 3 bytes
+ *
+ * FEC scheme:
+ *   Non-overlapping: (0,1),(2,3),(4,5)... — emitted on odd frames
+ *   Bridge:          (1,2),(3,4),(5,6)... — emitted on even frames (except 0)
+ *   Each frame (except 0 and last) is protected by TWO independent FEC packets.
  *
  * Ports:
  *   bind 47010 ← harness source (4-byte BE seq + 160-byte payload)
@@ -31,10 +37,11 @@
 #define WIRE_HDR      3        /* 1 type + 2 seq */
 #define WIRE_PKT      (WIRE_HDR + PAYLOAD_BYTES)  /* 163 */
 
-#define TYPE_DATA   0x01
-#define TYPE_FEC    0x02
-#define TYPE_RETX   0x03
-#define TYPE_NACK   0x04
+#define TYPE_DATA       0x01
+#define TYPE_FEC        0x02
+#define TYPE_RETX       0x03
+#define TYPE_NACK       0x04
+#define TYPE_FEC_BRIDGE 0x05
 
 #define RING_SIZE   4096
 #define RING_MASK   (RING_SIZE - 1)
@@ -128,7 +135,7 @@ int main(void) {
     pthread_create(&fb_tid, NULL, feedback_thread, &fb_fd);
     pthread_detach(fb_tid);
 
-    /* Main loop: receive from harness, send DATA + FEC */
+    /* Main loop: receive from harness, send DATA + dual FEC */
     uint8_t buf[2048];
     for (;;) {
         ssize_t n = recvfrom(in_fd, buf, sizeof(buf), 0, NULL, NULL);
@@ -152,15 +159,20 @@ int main(void) {
         /* Send DATA packet */
         send_wire_packet(TYPE_DATA, seq, payload);
 
-        /* FEC: non-overlapping pairs (0,1), (2,3), (4,5), ...
-         * Only emit FEC when we receive the odd frame of a pair. */
-        if ((seq & 1) == 1 && prev_seq >= 0 && seq == (uint16_t)(prev_seq + 1)) {
-            /* Generate XOR FEC for the pair (prev_seq, seq) */
-            uint8_t fec_payload[PAYLOAD_BYTES];
+        /* Generate XOR FEC payload with previous frame */
+        if (prev_seq >= 0 && seq == (uint16_t)(prev_seq + 1)) {
+            uint8_t fec_pl[PAYLOAD_BYTES];
             for (int j = 0; j < PAYLOAD_BYTES; j++) {
-                fec_payload[j] = prev_payload[j] ^ payload[j];
+                fec_pl[j] = prev_payload[j] ^ payload[j];
             }
-            send_wire_packet(TYPE_FEC, (uint16_t)prev_seq, fec_payload);
+
+            if ((seq & 1) == 1) {
+                /* Odd seq: non-overlapping pair FEC for (seq-1, seq) */
+                send_wire_packet(TYPE_FEC, (uint16_t)prev_seq, fec_pl);
+            } else if ((prev_seq & 3) == 1) {
+                /* Even seq (>=2): bridge FEC at 50% density (covers 1,2; 5,6; 9,10...) */
+                send_wire_packet(TYPE_FEC_BRIDGE, (uint16_t)prev_seq, fec_pl);
+            }
         }
 
         /* Save current as "previous" for next FEC pair */

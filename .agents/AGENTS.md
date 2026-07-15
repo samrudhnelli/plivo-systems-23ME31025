@@ -80,10 +80,11 @@ Harness Source →[47010]→ SENDER →[47001]→ RELAY →[47002]→ RECEIVER �
 | 4 | A | 50ms | 0.80% (12) | 1.55× | ✅ | Tighter delay — still valid but close |
 | 5 | A | 45ms | 1.27% (19) | 1.53× | ❌ | Too tight, NACKs can't complete |
 | 6 | A | 40ms | 4.07% (61) | 1.53× | ❌ | Way too tight |
+| 7 | A | 50ms | 0.33% (5) | 1.81× | ✅ | 50% Bridge FEC + Cascading Recovery — extremely robust |
 
 ## Key Files
-- `sender.c` — FEC sender with NACK retransmission (pthread for feedback listener)
-- `receiver.c` — Jitter buffer + FEC recovery + NACK sender + playout thread
+- `sender.c` — dual FEC sender (50% Bridge FEC) with NACK retransmission (pthread for feedback listener)
+- `receiver.c` — Jitter buffer + cascading FEC recovery + NACK sender + playout thread
 - `Makefile` — builds with `-lpthread`
 - `relay.py` — DO NOT MODIFY. Shows all impairment types (loss, burst_loss, delay, spike, dup)
 - `endpoints.py` — DO NOT MODIFY. Source + player threads.
@@ -102,19 +103,18 @@ Harness Source →[47010]→ SENDER →[47001]→ RELAY →[47002]→ RECEIVER �
 - Playout thread: timer-driven, delivers at T0 + DELAY_MS + i×20ms to player on 47020
 - 5ms SO_RCVTIMEO on receive socket enables periodic NACK sweep
 
-### FEC Pairing Scheme
-- Non-overlapping: (0,1),(2,3),(4,5)... — seq field = even frame number
-- Receiver uses `base = seq & ~1` to find pair base for any DATA packet
-- FEC payload = payload[even] XOR payload[odd]
+### Dual FEC Pairing Scheme
+- Standard Pair-FEC (0x02): Covers non-overlapping pairs `(2k, 2k+1)`. Sent on odd frames.
+- Bridge Pair-FEC (0x05): Covers overlapping pairs `(2k-1, 2k)`. Sent at 50% density on even frames (when `(prev_seq & 3) == 1`).
+- This sample density yields exactly 1.75× baseline packets, keeping total overhead (including headers and NACKs/RETX) strictly under 2.0×.
 
-### Potential Improvement: Sliding-Window FEC
-- Add "bridge" FEC for (1,2),(3,4),(5,6)... in addition to existing pairs
-- Each frame gets 2 independent FEC recovery paths
-- Budget allows ~690 bridge FEC packets before hitting 2.0× cap
-- Would need TYPE_FEC_BRIDGE (0x05) or encode pair-type in seq bits
+### Cascading Recovery Algorithm
+- Implemented as mutual recursion between `try_fec_recovery` and `trigger_recovery_cascade`.
+- When any frame is received or successfully recovered, `trigger_recovery_cascade` immediately tests both its standard FEC pair and its bridge FEC pair.
+- If either check recovers a neighbor frame, it triggers another recovery cascade for that neighbor, resolving multi-packet drops sequentially in a single step.
 
 ## Failure Modes to Watch
-1. **Burst loss** — consecutive frames lost defeats single-pair FEC
+1. **Burst loss** — consecutive frame drops > 2 defeats dual-pair FEC (though cascading mitigates short bursts)
 2. **Spike delays** — relay can add extra_ms spikes pushing packets past deadline
 3. **Clock drift** — playout thread uses CLOCK_REALTIME, should match harness
 4. **Buffer wraparound** — 8192 slots is fine for 1500 frames but watch for seq collisions

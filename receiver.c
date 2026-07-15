@@ -41,6 +41,7 @@
 #define TYPE_FEC    0x02
 #define TYPE_RETX   0x03
 #define TYPE_NACK   0x04
+#define TYPE_FEC_BRIDGE 0x05
 
 #define BUF_SIZE    8192
 #define BUF_MASK    (BUF_SIZE - 1)
@@ -108,10 +109,12 @@ static void send_nack(uint16_t seq) {
            (struct sockaddr *)&relay_fb_addr, sizeof(relay_fb_addr));
 }
 
-/* Try FEC recovery for a pair (base_seq, base_seq+1) */
-static void try_fec_recovery(uint16_t base_seq) {
+static void trigger_recovery_cascade(uint16_t seq);
+
+/* Try FEC recovery for a pair (base_seq, base_seq+1). Returns 1 if a frame was recovered, 0 otherwise. */
+static int try_fec_recovery(uint16_t base_seq) {
     int fec_idx = base_seq & BUF_MASK;
-    if (!fec_received[fec_idx]) return;
+    if (!fec_received[fec_idx]) return 0;
 
     uint16_t seq_a = base_seq;
     uint16_t seq_b = base_seq + 1;
@@ -124,12 +127,32 @@ static void try_fec_recovery(uint16_t base_seq) {
             jbuf_payload[idx_b][j] = fec_payload[fec_idx][j] ^ jbuf_payload[idx_a][j];
         }
         jbuf_received[idx_b] = 1;
+        /* Trigger cascade on recovered frame B */
+        trigger_recovery_cascade(seq_b);
+        return 1;
     } else if (!jbuf_received[idx_a] && jbuf_received[idx_b]) {
         /* Recover frame A = FEC XOR B */
         for (int j = 0; j < PAYLOAD_BYTES; j++) {
             jbuf_payload[idx_a][j] = fec_payload[fec_idx][j] ^ jbuf_payload[idx_b][j];
         }
         jbuf_received[idx_a] = 1;
+        /* Trigger cascade on recovered frame A */
+        trigger_recovery_cascade(seq_a);
+        return 1;
+    }
+    return 0;
+}
+
+/* Recursive cascading recovery when a frame becomes available */
+static void trigger_recovery_cascade(uint16_t seq) {
+    /* Try recovering the standard partner in (base_std, base_std+1) */
+    uint16_t standard_base = seq & ~1; /* Round down to even */
+    try_fec_recovery(standard_base);
+
+    /* Try recovering the bridge partner in (base_br, base_br+1) */
+    if (seq > 0) {
+        uint16_t bridge_base = (seq % 2 == 0) ? (seq - 1) : seq;
+        try_fec_recovery(bridge_base);
     }
 }
 
@@ -259,10 +282,8 @@ int main(void) {
                 memcpy(jbuf_payload[idx], payload, PAYLOAD_BYTES);
                 jbuf_received[idx] = 1;
 
-                /* Try FEC recovery for partner frame */
-                /* If seq is even, pair base = seq. If odd, pair base = seq-1 */
-                uint16_t base = seq & ~1;  /* Round down to even */
-                try_fec_recovery(base);
+                /* Trigger cascading FEC recovery for neighbors */
+                trigger_recovery_cascade(seq);
             }
 
             /* Update highest seen for gap detection */
@@ -286,12 +307,12 @@ int main(void) {
                     }
                 }
             }
-        } else if (type == TYPE_FEC) {
+        } else if (type == TYPE_FEC || type == TYPE_FEC_BRIDGE) {
             int fec_idx = seq & BUF_MASK;
             if (!fec_received[fec_idx]) {
                 memcpy(fec_payload[fec_idx], payload, PAYLOAD_BYTES);
                 fec_received[fec_idx] = 1;
-                /* Try immediate recovery */
+                /* Try immediate recovery; if it succeeds, it cascades recursively */
                 try_fec_recovery(seq);
             }
         }
