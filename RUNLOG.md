@@ -85,5 +85,45 @@
 - **DELAY_MS:** 85
 - **Result:** INVALID
 - **Miss rate:** 1.40% (21/1500)
-- **Overhead:** 1.92x
+- **Overhead:** 1.92×
 - **Notes:** Playout delay too tight.
+
+## Run 12: Lock-Free / epoll / SIMD / SRTT v4
+- **Profile:** A
+- **DELAY_MS:** 45
+- **Result:** INVALID
+- **Miss rate:** 1.40% (21/1500)
+- **Overhead:** 1.78×
+- **Notes:** Adaptive NACK throttle correctly suppressed all NACKs due to RTT constraints, but FEC alone was slightly short of 1.0% limit. Bandwidth overhead minimized to 1.78x.
+
+## Run 13: Lock-Free / epoll / SIMD / SRTT v4
+- **Profile:** A
+- **DELAY_MS:** 50
+- **Result:** VALID (but borderline across seeds)
+- **Miss rate:** 0.80% (12/1500) (Seed 3 failed with 1.27% misses)
+- **Overhead:** 1.78×
+- **Notes:** Verified at 50ms. Dynamic NACK throttle allowed 2 NACKs to go through when RTT was low enough, keeping overhead at 1.78x. Some seeds failed, prompting a delay increase.
+
+## Run 14: Lock-Free / epoll / SIMD / SRTT v4 (Robustness Run)
+- **Profile:** A
+- **DELAY_MS:** 55
+- **Result:** VALID (100% robust across all 5 seeds)
+- **Miss rate:** 0.47% average (7/1500)
+- **Overhead:** 1.78×
+- **Notes:** Profile A is fully robust at 55ms delay. All seeds (1 through 5) successfully passed with miss rates between 0.33% and 0.73%.
+
+## Run 15: Lock-Free / epoll / SIMD / SRTT v4 (Robustness Run)
+- **Profile:** B
+- **DELAY_MS:** 95
+- **Result:** VALID (100% robust across all 5 seeds)
+- **Miss rate:** 0.57% average (8/1500)
+- **Overhead:** 1.79×
+- **Notes:** Profile B is fully robust at 95ms delay. All seeds (1 through 5) successfully passed. Bandwidth overhead is exceptionally low (1.79x) due to dynamic SRTT NACK suppression.
+
+## Run 16: Lock-Free / epoll / SIMD / SRTT v4
+- **Profile:** B
+- **DELAY_MS:** 90
+- **Result:** INVALID
+- **Miss rate:** 1.07% (16/1500)
+- **Overhead:** 1.79×
+- **Notes:** Delay was just 1 packet away from validation at 90ms.

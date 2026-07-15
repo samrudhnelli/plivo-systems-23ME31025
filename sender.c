@@ -17,11 +17,6 @@
  *   Non-overlapping: (0,1),(2,3),(4,5)... — emitted on odd frames
  *   Bridge:          (1,2),(3,4),(5,6)... — emitted on even frames (except 0)
  *   Each frame (except 0 and last) is protected by TWO independent FEC packets.
- *
- * Ports:
- *   bind 47010 ← harness source (4-byte BE seq + 160-byte payload)
- *   send 47001 → relay uplink
- *   bind 47004 ← feedback from receiver via relay
  */
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -33,6 +28,7 @@
 #include <unistd.h>
 
 #define PAYLOAD_BYTES 160
+#define PAYLOAD_U64   (PAYLOAD_BYTES / 8) /* 20 blocks of 64-bit integers */
 #define HARNESS_HDR   4
 #define WIRE_HDR      3        /* 1 type + 2 seq */
 #define WIRE_PKT      (WIRE_HDR + PAYLOAD_BYTES)  /* 163 */
@@ -46,8 +42,8 @@
 #define RING_SIZE   4096
 #define RING_MASK   (RING_SIZE - 1)
 
-/* Ring buffer for retransmission */
-static uint8_t  ring_payload[RING_SIZE][PAYLOAD_BYTES];
+/* Ring buffer for retransmission (64-bit aligned for SIMD XOR) */
+static uint64_t ring_payload[RING_SIZE][PAYLOAD_U64];
 static int      ring_valid[RING_SIZE];
 static pthread_mutex_t ring_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -55,8 +51,8 @@ static pthread_mutex_t ring_lock = PTHREAD_MUTEX_INITIALIZER;
 static int out_fd;
 static struct sockaddr_in relay_addr;
 
-/* FEC state: hold previous frame for pair generation */
-static uint8_t  prev_payload[PAYLOAD_BYTES];
+/* FEC state: hold previous frame for pair generation (64-bit aligned) */
+static uint64_t prev_payload[PAYLOAD_U64];
 static int      prev_seq = -1;
 
 static void send_wire_packet(uint8_t type, uint16_t seq, const uint8_t *payload) {
@@ -84,10 +80,10 @@ static void *feedback_thread(void *arg) {
 
         pthread_mutex_lock(&ring_lock);
         if (ring_valid[idx]) {
-            uint8_t payload_copy[PAYLOAD_BYTES];
+            uint64_t payload_copy[PAYLOAD_U64];
             memcpy(payload_copy, ring_payload[idx], PAYLOAD_BYTES);
             pthread_mutex_unlock(&ring_lock);
-            send_wire_packet(TYPE_RETX, seq, payload_copy);
+            send_wire_packet(TYPE_RETX, seq, (const uint8_t *)payload_copy);
         } else {
             pthread_mutex_unlock(&ring_lock);
         }
@@ -161,22 +157,25 @@ int main(void) {
 
         /* Generate XOR FEC payload with previous frame */
         if (prev_seq >= 0 && seq == (uint16_t)(prev_seq + 1)) {
-            uint8_t fec_pl[PAYLOAD_BYTES];
-            for (int j = 0; j < PAYLOAD_BYTES; j++) {
-                fec_pl[j] = prev_payload[j] ^ payload[j];
+            uint64_t fec_pl[PAYLOAD_U64];
+            uint64_t *curr_pl = ring_payload[idx];
+            
+            #pragma GCC unroll 4
+            for (int j = 0; j < PAYLOAD_U64; j++) {
+                fec_pl[j] = prev_payload[j] ^ curr_pl[j];
             }
 
             if ((seq & 1) == 1) {
                 /* Odd seq: non-overlapping pair FEC for (seq-1, seq) */
-                send_wire_packet(TYPE_FEC, (uint16_t)prev_seq, fec_pl);
+                send_wire_packet(TYPE_FEC, (uint16_t)prev_seq, (const uint8_t *)fec_pl);
             } else if ((prev_seq & 3) == 1) {
                 /* Even seq (>=2): bridge FEC at 50% density (covers 1,2; 5,6; 9,10...) */
-                send_wire_packet(TYPE_FEC_BRIDGE, (uint16_t)prev_seq, fec_pl);
+                send_wire_packet(TYPE_FEC_BRIDGE, (uint16_t)prev_seq, (const uint8_t *)fec_pl);
             }
         }
 
         /* Save current as "previous" for next FEC pair */
-        memcpy(prev_payload, payload, PAYLOAD_BYTES);
+        memcpy(prev_payload, ring_payload[idx], PAYLOAD_BYTES);
         prev_seq = (int)seq;
     }
     return 0;
