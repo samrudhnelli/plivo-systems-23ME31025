@@ -152,8 +152,9 @@ int main(void) {
         /* Send DATA packet */
         send_wire_packet(TYPE_DATA, seq, payload);
 
-        /* FEC: pair with previous frame */
-        if (prev_seq >= 0 && seq == (uint16_t)(prev_seq + 1)) {
+        /* FEC: non-overlapping pairs (0,1), (2,3), (4,5), ...
+         * Only emit FEC when we receive the odd frame of a pair. */
+        if ((seq & 1) == 1 && prev_seq >= 0 && seq == (uint16_t)(prev_seq + 1)) {
             /* Generate XOR FEC for the pair (prev_seq, seq) */
             uint8_t fec_payload[PAYLOAD_BYTES];
             for (int j = 0; j < PAYLOAD_BYTES; j++) {
