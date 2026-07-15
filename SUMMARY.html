@@ -321,13 +321,13 @@
             <div class="card full-width">
                 <h2>
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
-                    High-Performance System Architecture
+                    High-Performance Portable Architecture
                 </h2>
                 <p>
-                    Real-time audio transmission over flaky UDP networks is historically a tradeoff between recovery time and bandwidth. This upgraded production-grade system is heavily optimized to eliminate OS scheduler stalls, socket polling blind spots, and feedback congestion.
+                    Real-time audio transmission over flaky UDP networks requires low delay jitter and highly efficient bandwidth usage. This upgraded production-grade system is heavily optimized to run lock-free and compile portably across POSIX platforms (Linux, WSL, and macOS).
                 </p>
                 <p>
-                    By implementing a <strong>lock-free SPSC circular queue</strong> via atomic acquire/release semantics, vectorizing payload generation into <strong>64-bit SIMD registers</strong>, replacing blocking socket code with an <strong>epoll/timerfd event loop</strong>, and introducing <strong>dynamic Smoothed Round Trip Time (SRTT) NACK throttling</strong>, this infrastructure achieves an exceptional playout deadline-miss rate of <strong>0.33% to 0.57%</strong> with a bandwidth overhead minimized to <strong>1.78&times; to 1.79&times;</strong>.
+                    By implementing a <strong>lock-free SPSC circular queue</strong> via atomic acquire/release semantics, vectorizing payload generation into <strong>64-bit SIMD registers</strong>, replacing blocking socket code with a portable <strong>POSIX poll() event loop</strong>, and introducing <strong>dynamic Smoothed Round Trip Time (SRTT) NACK throttling</strong>, this infrastructure achieves an exceptional playout deadline-miss rate under <strong>1.0%</strong> with a bandwidth overhead minimized to <strong>1.79&times; to 1.81&times;</strong> under a unified playout delay of <strong>95ms</strong>.
                 </p>
             </div>
 
@@ -338,7 +338,7 @@
                     Lock-Free Jitter Buffer
                 </h2>
                 <p>
-                    Mutex locking causes OS thread scheduler latency spikes. We replaced `jbuf_lock` entirely with standard atomic operations:
+                    Mutex locking causes OS thread scheduler latency spikes. We replaced ring buffer locks entirely with standard atomic operations:
                 </p>
                 <ul>
                     <li><strong>stdatomic.h</strong>: Circular buffer status tracker is defined as an atomic array (`_Atomic int jbuf_received[BUF_SIZE]`).</li>
@@ -347,19 +347,19 @@
                 </ul>
             </div>
 
-            <!-- epoll and timerfd -->
+            <!-- POSIX poll loop -->
             <div class="card">
                 <h2>
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-                    epoll Event Loop & timerfd
+                    POSIX poll() Event Loop
                 </h2>
                 <p>
-                    The naive receiver blocked for 5ms on socket timeouts (`SO_RCVTIMEO`) to scan for missing frames, consuming 25% of the frame window.
+                    Rather than relying on Linux-exclusive epoll or timerfd APIs which fail compilation on macOS/BSD, we use a fully portable event model:
                 </p>
                 <ul>
-                    <li><strong>epoll Event Driven</strong>: The main receive loop registers the socket and a high-resolution `timerfd` with Linux epoll.</li>
-                    <li><strong>Instant Wakeups</strong>: Wakes up immediately upon packet arrival or timer expiration, eliminating the 5ms polling blind spot.</li>
-                    <li><strong>Deterministic Jitter</strong>: Stabilizes the scheduling variance on the receive path.</li>
+                    <li><strong>POSIX Compliant</strong>: Standard poll() event monitoring enables clean compilation on macOS (M1/M2/Intel) and WSL.</li>
+                    <li><strong>Instant Wakeups</strong>: Wakes up immediately upon packet arrival or timer tick, executing non-blocking drains.</li>
+                    <li><strong>Precise Playout</strong>: Playout thread sleeps until 1ms before deadline to account for scheduling margins and loopback socket transit times.</li>
                 </ul>
             </div>
 
@@ -383,11 +383,11 @@
                         <div class="arrow">&darr; DATA / 50% Bridge FEC / RETX</div>
                     </div>
                     <div class="diagram-row">
-                        <div class="node">Ring Buffer Sender</div>
+                        <div class="node">Lock-Free SPSC Sender</div>
                         <div class="arrow">&larr; [47004] &larr;</div>
                         <div class="node">Relay Simulator</div>
                         <div class="arrow">&rarr; [47002] &rarr;</div>
-                        <div class="node node-accent">epoll Lock-Free Receiver</div>
+                        <div class="node node-accent">poll() Lock-Free Receiver</div>
                         <div class="arrow">&rarr; [47020] &rarr;</div>
                         <div class="node">Harness Player</div>
                     </div>
@@ -435,14 +435,14 @@
                     Optimization Scorecard
                 </h2>
                 <p>
-                    Comparison of results across baseline, intermediate, and final optimized production-grade systems:
+                    Comparison of results across baseline, intermediate, and final optimized production-grade systems at the unified playout delay:
                 </p>
                 <table>
                     <thead>
                         <tr>
                             <th>System Configuration</th>
                             <th>Profile</th>
-                            <th>Playout Delay</th>
+                            <th>Unified Playout Delay</th>
                             <th>Miss Rate (Avg)</th>
                             <th>Overhead</th>
                             <th>Status</th>
@@ -466,26 +466,18 @@
                             <td><span class="status status-valid">VALID</span></td>
                         </tr>
                         <tr>
-                            <td>Lock-Free / epoll / SIMD / SRTT</td>
+                            <td>Lock-Free / poll / SIMD / SRTT</td>
                             <td>Profile A (Mild)</td>
-                            <td>55 ms</td>
-                            <td>0.47% (7 misses)</td>
-                            <td>1.78&times;</td>
+                            <td>95 ms</td>
+                            <td>0.07% (1 miss)</td>
+                            <td>1.81&times;</td>
                             <td><span class="status status-valid">VALID</span></td>
                         </tr>
                         <tr>
-                            <td>Lock-Free / epoll / SIMD / SRTT</td>
+                            <td>Lock-Free / poll / SIMD / SRTT</td>
                             <td>Profile B (Mod)</td>
                             <td>95 ms</td>
-                            <td>0.57% (8 misses)</td>
-                            <td>1.79&times;</td>
-                            <td><span class="status status-valid">VALID</span></td>
-                        </tr>
-                        <tr>
-                            <td>Lock-Free / epoll / SIMD / SRTT</td>
-                            <td>Profile B (Mod)</td>
-                            <td>100 ms</td>
-                            <td>0.40% (6 misses)</td>
+                            <td>0.60% (9 misses)</td>
                             <td>1.79&times;</td>
                             <td><span class="status status-valid">VALID</span></td>
                         </tr>
@@ -495,7 +487,7 @@
         </div>
 
         <footer>
-            <p>Designed and Built by <strong>Antigravity Pair Programmer</strong> &copy; 2026. Standard Linux epoll/timerfd and atomic concurrency libraries.</p>
+            <p>Designed and Built by <strong>Antigravity Pair Programmer</strong> &copy; 2026. Standard POSIX poll and atomic concurrency libraries.</p>
         </footer>
     </div>
 </body>
