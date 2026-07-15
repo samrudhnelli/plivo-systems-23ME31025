@@ -188,18 +188,12 @@ static void *playout_thread(void *arg) {
         double now = now_sec();
 
         double target = deadline - 0.001; /* Deliver exactly 1ms before deadline */
-        if (target - now > 0.001) {
-            /* Sleep until 0.5ms before the target play time */
-            double sleep_time = (target - now) - 0.0005;
+        double rem = target - now;
+        if (rem > 0.0) {
             struct timespec ts;
-            ts.tv_sec = (time_t)sleep_time;
-            ts.tv_nsec = (long)((sleep_time - ts.tv_sec) * 1e9);
+            ts.tv_sec = (time_t)rem;
+            ts.tv_nsec = (long)((rem - ts.tv_sec) * 1e9);
             nanosleep(&ts, NULL);
-        }
-
-        /* Spin for the final microseconds with hardware-specific yield */
-        while (now_sec() < target) {
-            CPU_PAUSE();
         }
 
         uint16_t seq = (uint16_t)i;
